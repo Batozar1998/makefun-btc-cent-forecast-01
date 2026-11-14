@@ -1,113 +1,113 @@
 #!/usr/bin/env python3
-"""make.fun entry: btc-cent-forecast-01.
+"""btc-cent-forecast-01: Bitcoin's price 4 hours ahead.
 
-Forecast Bitcoin's US-dollar price 4 hours (240 minutes) after a
-checkpoint, from the 72 hours of 1-minute closes ending at it.
+Method
+------
+For each case we get 72 hours of 1-minute closes ending at the checkpoint.
+The forecast is the checkpoint close plus the median 240-minute price
+change observed over the last 48 hours of the case:
 
-Method (from the case's own prices, one market, BTC/USDC).
-The guess is the checkpoint price plus the market's own recent drift:
-the MEDIAN of the 240-minute price changes over the last 48 hours of
-the case, clipped to +/-$200. For a mean-absolute-error score the
-optimal point forecast is the conditional median of the 4h-ahead price,
-and the median 240-minute change is a robust (outlier-proof) estimate
-of where that median sits relative to the checkpoint price: these
-prices are a near-martingale, so the drift is small, but in a trending
-stretch it is real and the median change captures it without letting a
-few huge jumps set the whole forecast. The +/-$200 clip is a guard
-against an extreme drift estimate; the median rarely reaches it.
+    forecast = last_close + median(close[i] - close[i - 240])
+               for i over the final 48 hours of the series, where both
+               ends of each 240-minute change lie inside those 48 hours
+               (so the changes run from 44 hours before the checkpoint
+               to the checkpoint itself)
 
-Local practice score (6 practice cases, exact answers: p00-p04 from the
-next case's last price, p05 derived from the published baseline):
-mean absolute error 43096.92 cents vs the house persistence baseline's
-44521.58 cents (published 44521.576667, reproduced to 0.00003 cents;
-worst checkpoint $766.9679 matched exactly) — beats the baseline on
-4 of 6 cases (p00, p01, p02, p04). The same forecaster also beats
-persistence on a 17-case window cut from Binance US BTCUSDT just after
-the practice (Nov 11-14, 55014 vs 58839 cents) and on 41 cases combined
-(practice + 18 pre-practice + 17 post-practice: 42292 vs 43778 cents);
-it is slightly worse than persistence on the 18 choppy pre-practice
-cases (30007 vs 29307 cents), so the edge is real but modest and
-regime-dependent — practice is no guarantee of the final.
+Why the median of 240-minute changes: under absolute-error scoring the
+best single guess is the median of where the price could land, and the
+240-minute change is exactly the move we are trying to predict, measured
+on the same horizon. Taking the median over two days of such moves gives
+a robust middle estimate that ignores the occasional one-minute spike
+from a large trade in the underlying pool. The median change is clipped
+to +/- $200 so a wild stretch of history can never throw the guess far
+from the checkpoint price, and the result is rounded to the price grid's
+5 decimals.
 
-Deterministic (no randomness), standard library only, no network.
-Reads $MAKEFUN_INPUT_DIR (else /input), writes $MAKEFUN_OUTPUT_DIR
-(else /output): one <id>.out per <id>.in case file, in the format the
-kit's starter writes: {"forecasts": [{"case": "<id>", "price": <number>}]}.
+If a case ever arrived too short for a 240-minute lookback, the forecast
+falls back to persistence (the last close) rather than guessing blind.
+
+I/O (per the kit's RULES.txt): read every ``*.in`` file in
+$MAKEFUN_INPUT_DIR (default /input), write one ``<id>.out`` per case to
+$MAKEFUN_OUTPUT_DIR (default /output) holding exactly
+``{"forecasts": [{"case": "<id>", "price": <number>]}``. Standard library
+only, no network, deterministic: the same case always gives the same
+bytes, well inside the 8-second cap (a few thousand subtractions and a
+sort per case).
 """
 
 import json
-import math
 import os
-import sys
+import statistics
+from pathlib import Path
+
+HORIZON_MINUTES = 240          # forecast horizon: 4 hours
+WINDOW_MINUTES = 48 * 60       # look back over the last 48 hours
+MAX_DRIFT = 200.0              # clip the median 240-minute change to +/- $200
+GRID_DECIMALS = 5              # the price grid's 5 decimals of a dollar
+MIN_PRICE = 0.00001            # scorer bounds: price must be in (0, 10_000_000)
+MAX_PRICE = 9_999_999.99999
 
 INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
-# Horizon of the forecast, in minutes (also the change horizon).
-HORIZON = 240
-# How many minutes of history the drift estimate uses (48 hours).
-LOOKBACK = 2880
-# The drift estimate is clipped to this many dollars either way.
-DRIFT_CLIP = 200.0
-# Price grid: 5 decimals, inside the scorer's (0, 10,000,000).
-MIN_PRICE = 0.00001
-MAX_PRICE = 9999999.99999
+
+def snap_to_grid(price: float) -> float:
+    """Keep a price on the 5-decimal grid and inside the scorer's bounds."""
+    clipped = min(MAX_PRICE, max(MIN_PRICE, price))
+    return round(clipped, GRID_DECIMALS)
 
 
-def price5(x):
-    """Keep x on the grid's 5 decimals and inside (0, 10,000,000)."""
-    return round(min(MAX_PRICE, max(MIN_PRICE, x)) * 1e5) / 1e5
-
-
-def median(sorted_vals):
-    """Median of an already-sorted list."""
-    n = len(sorted_vals)
-    if n == 0:
-        return 0.0
-    if n % 2:
-        return sorted_vals[n // 2]
-    return 0.5 * (sorted_vals[n // 2 - 1] + sorted_vals[n // 2])
-
-
-def forecast_price(prices):
-    """The 4h-ahead price guess for one case's 1-minute closes."""
+def forecast_case(prices):
+    """Forecast the close 240 minutes after the last price in ``prices``."""
     if not prices:
-        raise ValueError("market has no prices")
-    x = prices[-1]
-    # Reject bools (int subclass) and non-finite values before use.
-    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x):
+        raise ValueError("case holds no prices")
+    last = prices[-1]
+    if not isinstance(last, (int, float)) or last != last:  # NaN guard
         raise ValueError("last price is not a finite number")
-    sub = prices[-LOOKBACK:]
-    if len(sub) <= HORIZON:
-        # Too little history for a 240-minute change: persistence.
-        return price5(x)
-    changes = [sub[t + HORIZON] - sub[t] for t in range(len(sub) - HORIZON)]
-    changes.sort()
-    drift = median(changes)
-    drift = max(-DRIFT_CLIP, min(DRIFT_CLIP, drift))
-    return price5(x + drift)
+
+    # Not enough history for even one 240-minute change: stay put.
+    if len(prices) <= HORIZON_MINUTES:
+        return snap_to_grid(last)
+
+    # The final 48 hours of the series, and the 240-minute changes fully
+    # inside them: each change's earlier end is at least 240 minutes
+    # after the window opens, so no change reaches back before it.
+    window_start = max(0, len(prices) - WINDOW_MINUTES)
+    start = window_start + HORIZON_MINUTES
+    if start >= len(prices):
+        return snap_to_grid(last)
+    changes = [prices[i] - prices[i - HORIZON_MINUTES]
+               for i in range(start, len(prices))]
+    if not changes:
+        return snap_to_grid(last)
+
+    drift = statistics.median(changes)
+    drift = max(-MAX_DRIFT, min(MAX_DRIFT, drift))
+    return snap_to_grid(last + drift)
 
 
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    names = sorted(f for f in os.listdir(INPUT_DIR) if f.endswith(".in"))
-    if not names:
-        print("no .in files in %s" % INPUT_DIR, file=sys.stderr)
-        sys.exit(1)
-    for name in names:
-        case_id = name[:-3]
-        with open(os.path.join(INPUT_DIR, name), "r", encoding="utf-8") as f:
-            case = json.load(f)
+    in_dir = Path(INPUT_DIR)
+    out_dir = Path(OUTPUT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    case_files = sorted(in_dir.glob("*.in"))
+    for case_file in case_files:
+        case_id = case_file.name[: -len(".in")]
+        with case_file.open("r", encoding="utf-8") as fh:
+            case = json.load(fh)
         markets = case.get("markets")
         if not isinstance(markets, list) or len(markets) != 1:
-            raise ValueError("%s does not hold exactly one market" % name)
-        price = forecast_price(markets[0]["prices"])
-        out = {"forecasts": [{"case": case_id, "price": price}]}
-        out_path = os.path.join(OUTPUT_DIR, case_id + ".out")
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(out, f, separators=(",", ":"))
-            f.write("\n")
-    print("wrote %d forecast(s) to %s" % (len(names), OUTPUT_DIR))
+            raise ValueError(f"{case_file.name} does not hold exactly one market")
+        prices = markets[0].get("prices")
+        if not isinstance(prices, list) or not prices:
+            raise ValueError(f"{case_file.name} holds no prices")
+
+        guess = forecast_case(prices)
+        payload = {"forecasts": [{"case": case_id, "price": guess}]}
+        out_path = out_dir / f"{case_id}.out"
+        with out_path.open("w", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload) + "\n")
 
 
 if __name__ == "__main__":
