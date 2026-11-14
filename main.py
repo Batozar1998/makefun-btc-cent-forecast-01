@@ -36,6 +36,7 @@ kit's starter writes: {"forecasts": [{"case": "<id>", "price": <number>}]}.
 """
 
 import json
+import math
 import os
 import sys
 
@@ -73,7 +74,8 @@ def forecast_price(prices):
     if not prices:
         raise ValueError("market has no prices")
     x = prices[-1]
-    if not isinstance(x, (int, float)) or x != x or x in (float("inf"), float("-inf")):
+    # Reject bools (int subclass) and non-finite values before use.
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x):
         raise ValueError("last price is not a finite number")
     sub = prices[-LOOKBACK:]
     if len(sub) <= HORIZON:

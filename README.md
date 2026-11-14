@@ -34,7 +34,8 @@ network, standard library only:
   is a guard against an extreme drift estimate.
 - The guess is rounded to the price grid's 5 decimals and kept inside
   (0, 10,000,000). If a case has too little history for a 240-minute
-  change, it falls back to persistence (the checkpoint price).
+  change, it falls back to persistence (the checkpoint price). A
+  non-finite or boolean last price is rejected rather than forecast.
 
 ## Local practice score
 
